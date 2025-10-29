@@ -44,6 +44,7 @@ import org.webrtc.RtpReceiver
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.Response
+import org.json.JSONObject
 import org.webrtc.Camera2Enumerator
 import org.webrtc.CameraVideoCapturer
 import org.webrtc.MediaConstraints
@@ -62,7 +63,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-val HOST = "192.168.11.16"
+val HOST = "192.168.11.47"
 //val HOST = "10.0.2.2"
 @Composable
 fun MainScreen() {
@@ -233,10 +234,14 @@ fun startSignaling(
     val mainHandler = Handler(Looper.getMainLooper())
     fun postLog(msg: String) = mainHandler.post { onLog(msg) }
 
-//    postLog("ボタン押された！")
+    postLog("Initializing PeerConnectionFactory…")
 
-    // ★ ここは引数の eglBase を使う（新しく作らない）
-    val encoderFactory = DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true)
+    // --- WebRTC Factory 初期化 ---
+    val encoderFactory = DefaultVideoEncoderFactory(
+        eglBase.eglBaseContext,
+        /* enableIntelVp8Encoder */ true,
+        /* enableH264HighProfile */ true
+    )
     val decoderFactory = DefaultVideoDecoderFactory(eglBase.eglBaseContext)
 
     PeerConnectionFactory.initialize(
@@ -249,211 +254,186 @@ fun startSignaling(
         .setVideoDecoderFactory(decoderFactory)
         .createPeerConnectionFactory()
 
-    // ---- PeerConnection 作成（あなたの既存コードそのまま） ----
+    // --- ICE Servers ---
     val iceServers = listOf(
         PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()
     )
     val config = PeerConnection.RTCConfiguration(iceServers)
 
+    // --- PeerConnection 作成 ---
     pc = factory.createPeerConnection(config, object : PeerConnection.Observer {
         override fun onSignalingChange(state: PeerConnection.SignalingState?) {
-//            postLog("Signaling state: $state")
+            postLog("Signaling state: $state")
         }
 
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
-            postLog("ICE connection state: $state")
-
-            when (state) {
-                PeerConnection.IceConnectionState.CONNECTED -> {
-                    postLog("✅ P2P接続が確立しました！（ICE CONNECTED）")
-                }
-                PeerConnection.IceConnectionState.COMPLETED -> {
-                    postLog("✅ ICE接続が完全に確立しました！（COMPLETED）")
-                }
-                PeerConnection.IceConnectionState.FAILED -> {
-                    postLog("❌ ICE接続に失敗しました")
-                }
-                else -> {}
-            }
-        }
-
-        override fun onIceConnectionReceivingChange(receiving: Boolean) {
-            postLog("ICE receiving: $receiving")
-        }
-
-        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
-            postLog("ICE gathering state: $state")
-            if (state == PeerConnection.IceGatheringState.COMPLETE) {
-//                val sdp = pc?.localDescription
-//                if (sdp != null) {
-//                    val offerJson = Gson().toJson(
-//                        mapOf("type" to sdp.type.canonicalForm(), "data" to mapOf("sdp" to sdp.description, "roomId" to 1, "userId" to 3))
-//                    )
-//                    webSocket?.send(offerJson)
-////                    postLog("ICE完了後にOffer送信")
-//                }
-            }
+            postLog("ICE connection: $state")
         }
 
         override fun onIceCandidate(candidate: IceCandidate?) {
-//            postLog("New ICE candidate: $candidate")
-            if (candidate != null) {
-                val candidateJson = Gson().toJson(
-                    mapOf(
-                        "type" to "candidate",
-                        "data" to mapOf(
-                            "roomId" to 1,
-                            "userId" to 3,
-                            "sdpMid" to candidate.sdpMid,
-                            "sdpMLineIndex" to candidate.sdpMLineIndex,
-                            "candidate" to candidate.sdp
-                        )
-                    )
-                )
-                webSocket?.send(candidateJson)
-//                postLog("ICE Candidate送信: ${candidate.sdp.take(30)}...")
+            candidate ?: return
+            val json = JSONObject().apply {
+                put("type", "candidate")
+                put("data", JSONObject().apply {
+                    put("sdpMid", candidate.sdpMid)
+                    put("sdpMLineIndex", candidate.sdpMLineIndex)
+                    put("candidate", candidate.sdp)
+                })
             }
+            webSocket?.send(json.toString())
+            postLog("📤 ICE Candidate sent")
         }
 
-        override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {
-            postLog("ICE candidates removed")
-        }
-
-        override fun onAddStream(stream: MediaStream?) {
-            postLog("Stream added: ${stream?.id}")
-        }
-
-        override fun onRemoveStream(stream: MediaStream?) {
-            postLog("Stream removed: ${stream?.id}")
-        }
-
-        override fun onDataChannel(channel: DataChannel?) {
-            postLog("DataChannel opened: ${channel?.label()}")
-        }
-
-        override fun onRenegotiationNeeded() {
-            postLog("Renegotiation needed")
+        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
+            postLog("ICE gathering: $state")
         }
 
         override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
-            postLog("Track added: ${receiver?.track()?.id()}")
+            postLog("Track added: ${receiver?.track()?.kind()}")
         }
+
+        override fun onDataChannel(channel: DataChannel?) {}
+        override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
+        override fun onIceConnectionReceivingChange(p0: Boolean) {}
+        override fun onAddStream(p0: MediaStream?) {}
+        override fun onRemoveStream(p0: MediaStream?) {}
+        override fun onRenegotiationNeeded() {}
     })
 
-    if (pc == null) { postLog("PeerConnection の作成に失敗しました"); return } else postLog("PeerConnection 作成成功！")
+    if (pc == null) {
+        postLog("❌ PeerConnection creation failed")
+        return
+    }
+    postLog("✅ PeerConnection created")
 
-    // ---- カメラ映像の VideoTrack 作成（あなたの既存コード）----
+    // --- カメラ映像の準備 ---
     val videoSource = factory.createVideoSource(false)
-    val surfaceTextureHelper = SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
+    val surfaceTextureHelper =
+        SurfaceTextureHelper.create("CaptureThread", eglBase.eglBaseContext)
     val enumerator = Camera2Enumerator(context)
 
-    val videoCapturer: CameraVideoCapturer? =
-        enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }?.let { enumerator.createCapturer(it, null) }
-            ?: enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }?.let { enumerator.createCapturer(it, null) }
+    val videoCapturer: CameraVideoCapturer? = enumerator.deviceNames
+        .firstOrNull { enumerator.isFrontFacing(it) }
+        ?.let { enumerator.createCapturer(it, null) }
+        ?: enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }
+            ?.let { enumerator.createCapturer(it, null) }
 
-    if (videoCapturer == null) { postLog("カメラが見つかりません"); return }
+    if (videoCapturer == null) {
+        postLog("❌ Camera not found")
+        return
+    }
 
     videoCapturer.initialize(surfaceTextureHelper, context, videoSource.capturerObserver)
     videoCapturer.startCapture(1280, 720, 30)
 
     val videoTrack = factory.createVideoTrack("ARDAMSv0", videoSource)
-
-    // ★ ここが重要：UI に渡す
-    onLocalVideo(videoTrack)
-
-    // ---- 音声トラック（あなたの既存コード）----
     val audioSource = factory.createAudioSource(MediaConstraints())
     val audioTrack = factory.createAudioTrack("ARDAMSa0", audioSource)
-    // ---- PeerConnection にトラック追加 ----
     pc?.addTrack(videoTrack)
     pc?.addTrack(audioTrack)
-    // WebSocket 接続開始
+    onLocalVideo(videoTrack)
+
+    // --- WebSocket Signaling ---
     val client = OkHttpClient()
-    val request = Request.Builder().url("ws://$HOST:8080/ws/live/1/2").build()
+    val request = Request.Builder()
+        .url("ws://$HOST:8080/ws/live/1/${(1000000..9999999).random()}")
+        .build()
+
     webSocket = client.newWebSocket(request, object : WebSocketListener() {
         override fun onOpen(ws: WebSocket, response: Response) {
-//            postLog("WebSocket接続成功")
-            val joinJson = Gson().toJson(
-                mapOf("type" to "join", "data" to mapOf("roomId" to 1, "userId" to 3))
-            )
-            webSocket?.send(joinJson)
+            postLog("🌐 WebSocket connected")
+            ws.send(JSONObject(mapOf("type" to "offer")).toString())
         }
 
         override fun onMessage(ws: WebSocket, text: String) {
-//            postLog("サーバーから受信: $text")
             try {
-                val json = Gson().fromJson(text, Map::class.java)
-                val type = json["type"] as? String
-                postLog("type: $type")
-                when (json["type"]) {
-                    "answer" -> {
-                        val data = json["data"] as? Map<*, *>
-                        val sdp = data?.get("sdp") as? String
-                        if (sdp != null) {
-                            if (pc?.signalingState() == PeerConnection.SignalingState.STABLE) {
-                                postLog("⚠️ すでにstable。Answer再セットをスキップ")
-                                return
-                            }
-                            val answer = SessionDescription(SessionDescription.Type.ANSWER, sdp)
-                            pc?.setRemoteDescription(object : SdpObserver {
-                                override fun onSetSuccess() { postLog("Answer受信＆セット成功") }
-                                override fun onSetFailure(p0: String?) { postLog("Answerセット失敗: $p0") }
-                                override fun onCreateSuccess(p0: SessionDescription?) {}
-                                override fun onCreateFailure(p0: String?) {}
-                            }, answer)
-                        } else {
-                            postLog("⚠️ sdp が見つかりません: $json")
-                        }
-                    }
-                    "candidate" -> {
-                        val data = json["data"] as? Map<*, *>
-                        val sdpMid = data?.get("sdpMid") as? String
-                        val sdpMLineIndex = data?.get("sdpMLineIndex") as? Int
-                        val sdp = data?.get("candidate") as? String
-                        val iceCandidate = IceCandidate(sdpMid, sdpMLineIndex ?: 0, sdp)
-                        pc?.addIceCandidate(iceCandidate)
-//                        postLog("ICE Candidate追加: ${sdp.take(30)}...")
-                    }
-                    "join" -> {
-                        // 接続成功後に Offer を作る
-//                        val constraints = MediaConstraints()
-                        val constraints = MediaConstraints().apply {
-                            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
-                            mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true"))
-                        }
-                        pc?.createOffer(object : SdpObserver {
-                            override fun onCreateSuccess(desc: SessionDescription) {
-                                postLog("Offer作成成功")
-                                pc?.setLocalDescription(object : SdpObserver {
-                                    override fun onSetSuccess() {
-                                        val offerJson = Gson().toJson(
-                                            mapOf("type" to "offer", "data" to mapOf("sdp" to desc.description, "roomId" to 1, "userId" to 3))
-                                        )
-                                        webSocket?.send(offerJson)
-                                        postLog("Offer送信: ${desc.description.take(30)}...")
+                val json = JSONObject(text)
+                val type = json.optString("type")
+
+                when (type) {
+                    // サーバーから offer を受信したとき
+                    "offer" -> {
+                        val data = json.getJSONObject("data")
+                        val sdp = data.getString("sdp")
+                        val sdpType = data.optString("type", "offer")
+
+                        val offer = SessionDescription(
+                            SessionDescription.Type.fromCanonicalForm(sdpType),
+                            sdp
+                        )
+
+                        pc?.setRemoteDescription(object : SdpObserver {
+                            override fun onSetSuccess() {
+                                postLog("✅ RemoteDescription set (offer)")
+                                // Answer作成
+                                pc?.createAnswer(object : SdpObserver {
+                                    override fun onCreateSuccess(desc: SessionDescription) {
+                                        pc?.setLocalDescription(object : SdpObserver {
+                                            override fun onSetSuccess() {
+                                                // Answer送信（HTML版と完全一致）
+                                                val msg = JSONObject().apply {
+                                                    put("type", "answer")
+                                                    put("data", JSONObject().apply {
+                                                        put("sdp", desc.description)
+                                                    })
+                                                }
+                                                ws.send(msg.toString())
+                                                postLog("📤 Answer sent")
+                                            }
+
+                                            override fun onSetFailure(error: String) {
+                                                postLog("❌ setLocalDescription failed: $error")
+                                            }
+
+                                            override fun onCreateSuccess(p0: SessionDescription?) {}
+                                            override fun onCreateFailure(p0: String?) {}
+                                        }, desc)
                                     }
-                                    override fun onSetFailure(error: String?) { postLog("setLocalDescription失敗: $error") }
-                                    override fun onCreateSuccess(p0: SessionDescription?) {}
-                                    override fun onCreateFailure(p0: String?) {}
-                                }, desc)
+
+                                    override fun onCreateFailure(error: String) {
+                                        postLog("❌ createAnswer failed: $error")
+                                    }
+
+                                    override fun onSetSuccess() {}
+                                    override fun onSetFailure(p0: String?) {}
+                                }, MediaConstraints())
                             }
 
-                            override fun onCreateFailure(error: String) {
-                                postLog("Offer作成失敗: $error")
+                            override fun onSetFailure(error: String) {
+                                postLog("❌ setRemoteDescription failed: $error")
                             }
 
-                            override fun onSetSuccess() {}
-                            override fun onSetFailure(p0: String?) {}
-                        }, constraints)
+                            override fun onCreateSuccess(p0: SessionDescription?) {}
+                            override fun onCreateFailure(p0: String?) {}
+                        }, offer)
                     }
+
+                    // ICE candidate を受信
+                    "candidate" -> {
+                        val data = json.getJSONObject("data")
+                        val candidate = IceCandidate(
+                            data.getString("sdpMid"),
+                            data.getInt("sdpMLineIndex"),
+                            data.getString("candidate")
+                        )
+                        pc?.addIceCandidate(candidate)
+                        postLog("✅ Candidate added")
+                    }
+
+                    else -> postLog("⚠️ Unknown msg type: $type")
                 }
+
             } catch (e: Exception) {
-                postLog("受信エラー: ${e.message}")
+                postLog("❌ JSON parse error: ${e.message}")
             }
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-            postLog("WebSocketエラー: ${t.message}")
+            postLog("❌ WebSocket error: ${t.message}")
+        }
+
+        override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+            postLog("WebSocket closed: $reason")
         }
     })
 }
